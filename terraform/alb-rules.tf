@@ -1,3 +1,5 @@
+# Retrigger (26/09): forca reapply pra sincronizar a regra do listener mTLS
+# apos o listener 8443 do poc-keycloak ter sido recriado varias vezes hoje.
 # Listener 80 (HTTP): /auth/token e /public/ping vao para o backend normalmente.
 resource "aws_lb_listener_rule" "public_http" {
   listener_arn = data.aws_lb_listener.http.arn
