@@ -13,17 +13,17 @@ Simplificado em relação ao plano corporativo real: sem domínio próprio, sem 
 ## 2. Papel deste serviço (poc-backend)
 
 É o único serviço com lógica de negócio própria (Spring Boot). Expõe 3 endpoints atrás do ALB compartilhado:
-- `POST /auth/token` — porta 80 (HTTP), recebe o `serialNumber` do terminal, cria o usuário no Keycloak se necessário (username = serial number, **sem senha**) e devolve um token via **OAuth2 Token Exchange** (RFC 8693).
+- `POST /auth/token` — porta 80 (HTTP), recebe o `serialNumber` do terminal, cria o usuário no Keycloak se necessário (username = serial number, com senha derivada — ver abaixo) e devolve um **ID Token OIDC** via **Direct Access Grant**.
 - `GET /public/ping` — porta 80 (HTTP), sempre 200, sem exigir nada (prova que a porta "normal" funciona).
 - `GET /consumer/ping` — só acessível pelo listener **mTLS** (8443); no listener 80 esse path é explicitamente bloqueado (404 fixo) pelo Terraform deste repositório.
 
 Fala com o Keycloak sempre via Cloud Map (`http://keycloak.poc-mtls.local:8080`), nunca por IP.
 
-**Detalhe crítico de implementação (não pular)**: o step-ca valida um **ID Token OIDC** (JWT assinado pelo Keycloak), não um `access_token` opaco. Por isso `/auth/token` precisa pedir o token ao Keycloak com `scope=openid` e devolver o campo **`id_token`** da resposta do Keycloak no campo `accessToken`/`access_token` do contrato deste endpoint (com fallback pro `access_token` caso o `id_token` não venha). Se devolver o `access_token` "de verdade" do Keycloak em vez do `id_token`, o step-ca vai rejeitar a assinatura do CSR. Ver `KeycloakService.exchangeTokenForSubject`.
+**Por que não é Token Exchange (e por que isso importa)**: a primeira versão deste serviço tentava emitir o token via **OAuth2 Token Exchange** (RFC 8693), impersonando o terminal com a identidade do próprio `poc-backend`. Validamos, testando ao vivo contra o Keycloak, que esse grant **nunca devolve `id_token`** — não importa `scope=openid`, `audience` ou `requested_token_type`, é uma limitação do mecanismo (Token Exchange v1 do Keycloak foi feito pra impersonação access-token-a-access-token, não pra emitir credenciais OIDC completas). O step-ca exige um **ID Token de verdade** (`aud` batendo no client `step-ca-oidc`) — sem isso ele recusa com `401`. A solução real: usar **Direct Access Grant** (`grant_type=password`), que é o único grant que autentica de fato um "usuário" e por isso emite `id_token`. Isso significa que o usuário-terminal **passa a ter senha** — ver `KeycloakService`.
 
-Cada terminal é modelado como **1 usuário único no Keycloak, sem senha nunca** — o `poc-backend` nunca autentica como o terminal (não existe `grant_type=password` nesse fluxo). Em vez disso: (1) o backend pega seu **próprio token** via `client_credentials` (usado tanto pra chamar a Admin API quanto como `subject_token`); (2) cria o usuário-terminal se ele ainda não existir (`findUserIdByUsername`/`createUser`, sem `email`/`credentials`); (3) troca esse token pelo do usuário-terminal via `grant_type=urn:ietf:params:oauth:grant-type:token-exchange` + `requested_subject=<serialNumber>` — é o "impersonate" via token exchange, não o Admin Impersonation API (são mecanismos diferentes, ver histórico de troubleshooting deste projeto).
+**Como funciona, de ponta a ponta**: (1) o backend pega seu **próprio token** via `client_credentials` (usado só pra chamar a Admin API); (2) cria o usuário-terminal se ele ainda não existir (`findUserIdByUsername`/`createUser`) — com `firstName=<serialNumber>`, `lastName`/`email` mock, e uma **senha derivada** (`seed + serialNumber`, ver `KeycloakService.derivePassword` — o seed nasce uma única vez no Terraform, `poc-backend` nunca persiste senha nenhuma); (3) loga como esse terminal via `grant_type=password` **contra o client `step-ca-oidc`** (não `poc-backend`) com `scope=openid`, e devolve o `id_token` da resposta.
 
-**Pré-requisito de configuração no Keycloak (feito manualmente no console, documentado aqui pra não se perder)**: o realm `poc-terminal` precisa ter a feature `token-exchange` habilitada no servidor (`Dockerfile` do `poc-keycloak`, flag `--features=token-exchange,admin-fine-grained-authz`), e duas permissões configuradas: `Clients → poc-backend → Advanced → Permissions enabled` + a permissão `token-exchange` desse client com uma policy liberando o próprio `poc-backend`; e `Users → Permissions → impersonate` com a mesma policy. Sem isso, o Keycloak recusa com `{"error":"access_denied","error_description":"Client not allowed to exchange"}`.
+**Pré-requisito de configuração no Keycloak**: o client `step-ca-oidc` precisa ter **Direct Access Grants habilitado** — sem isso o Keycloak recusa o grant `password`. E o Keycloak exige `email`/`firstName`/`lastName` preenchidos no usuário para considerar a conta "completa" — sem isso o login falha com `{"error":"invalid_grant","error_description":"Account is not fully set up"}` (erro real encontrado ao validar este fluxo, nada a ver com a senha em si).
 
 ## 3. Contrato entre serviços (fonte de verdade — igual nos 3 READMEs)
 
@@ -36,7 +36,9 @@ Cada terminal é modelado como **1 usuário único no Keycloak, sem senha nunca*
 | Admin REST API (criar usuário) | `POST http://keycloak.poc-mtls.local:8080/admin/realms/poc-terminal/users` |
 | Token endpoint | `POST http://keycloak.poc-mtls.local:8080/realms/poc-terminal/protocol/openid-connect/token` |
 | SSM: secret do client `poc-backend` | `/poc-mtls/keycloak/backend-client-secret` (SecureString) |
-| SSM: secret do client `step-ca-oidc` | `/poc-mtls/keycloak/stepca-client-secret` (SecureString) |
+| SSM: secret do client `step-ca-oidc` | `/poc-mtls/keycloak/stepca-client-secret` (SecureString) — lido também pelo `poc-backend`, que agora loga como esse client |
+| SSM: seed da senha do terminal | `/poc-mtls/backend/terminal-auth-seed` (SecureString, gerado pelo Terraform deste repo) |
+| Fórmula da senha do usuário-terminal | `seed + serialNumber` (concatenação simples — nunca persistida, sempre recalculada) |
 | Bucket S3 da CA raiz | criado pelo `poc-certificate`, objeto `root_ca.crt` |
 | ALB (nome/tag) | `data "aws_lb" "shared"` por tag `Name=poc-mtls-shared-alb` |
 | Cluster ECS | `data "aws_ecs_cluster" "this"` — nome fixo `poc-mtls-ECS` |
@@ -53,16 +55,17 @@ Cada terminal é modelado como **1 usuário único no Keycloak, sem senha nunca*
 Já implementado neste repositório (Spring Boot 3 / Java 17 / Maven, sem Spring Security — desnecessário para o escopo):
 - `AuthController` — `POST /auth/token`, recebe `{"serialNumber": "..."}`, devolve `{"accessToken": "<id_token do Keycloak>"}`.
 - `PingController` — `GET /public/ping` (sempre 200) e `GET /consumer/ping` (ecoa o header `X-Amzn-Mtls-Clientcert-Subject` que o ALB injeta quando o mutual TLS é validado).
-- `KeycloakService` — `fetchServiceAccountToken` (client_credentials), `findUserIdByUsername`/`createUser` (Admin REST API, sem email/credentials), `exchangeTokenForSubject` (grant `urn:ietf:params:oauth:grant-type:token-exchange`, `requested_subject=<serialNumber>`, `scope=openid`, lê `id_token` da resposta com fallback pra `access_token`).
-- `terraform/ecs.tf` — task definition (env `KEYCLOAK_BASE_URL`, secret `KEYCLOAK_BACKEND_CLIENT_SECRET` do SSM), 2 target groups (`backend-public-tg`, `backend-consumer-tg`), service com os 2 `load_balancer` blocks.
+- `KeycloakService` — `fetchServiceAccountToken` (client_credentials, só pra Admin API), `findUserIdByUsername`/`createUser` (Admin REST API, com `firstName`/`lastName`/`email` mock e senha derivada), `derivePassword` (`seed + serialNumber`), `loginAsTerminal` (`grant_type=password` contra o client `step-ca-oidc`, `scope=openid`, lê `id_token` da resposta).
+- `terraform/ecs.tf` — task definition (env `KEYCLOAK_BASE_URL`, secrets `KEYCLOAK_BACKEND_CLIENT_SECRET`/`KEYCLOAK_STEPCA_CLIENT_SECRET`/`TERMINAL_AUTH_SEED` do SSM — o último gerado pelo próprio Terraform via `random_password`), 2 target groups (`backend-public-tg`, `backend-consumer-tg`), service com os 2 `load_balancer` blocks.
 - `terraform/alb-rules.tf` — regra no listener 80 para `/auth/token` + `/public/ping` → target group público; regra de bloqueio (404) para `/consumer/*` no listener 80; regra no listener 8443 (mTLS) para `/consumer/*` → target group consumer.
 
 **Pré-requisito de ordem**: este repositório só deve rodar depois que (a) `poc-keycloak` já publicou o SSM do client secret, e (b) `poc-keycloak` já fez a 2ª leva (`enable_mtls_listener=true`) — a regra do listener 8443 depende desse listener já existir.
 
 ## 5. Variáveis de ambiente / SSM
 
-- Consome: `/poc-mtls/keycloak/backend-client-secret` (SSM SecureString, escrito pelo `poc-keycloak`).
-- Env vars do container: `KEYCLOAK_BASE_URL=http://keycloak.poc-mtls.local:8080` (fixo), `KEYCLOAK_BACKEND_CLIENT_SECRET` (via secret SSM).
+- Consome: `/poc-mtls/keycloak/backend-client-secret` e `/poc-mtls/keycloak/stepca-client-secret` (SSM SecureString, escritos pelo `poc-keycloak`).
+- Produz: `/poc-mtls/backend/terminal-auth-seed` (SSM SecureString, gerado pelo próprio Terraform deste repo via `random_password` — ninguém digita/versiona esse valor em lugar nenhum).
+- Env vars do container: `KEYCLOAK_BASE_URL=http://keycloak.poc-mtls.local:8080` (fixo), `KEYCLOAK_BACKEND_CLIENT_SECRET`, `KEYCLOAK_STEPCA_CLIENT_SECRET`, `TERMINAL_AUTH_SEED` (os 3 últimos via secret SSM).
 
 ## 6. Workflow de CI/CD (`.github/workflows/deploy.yml`)
 
@@ -73,7 +76,8 @@ Em push na `main`: assume a IAM role via OIDC → cria o repositório ECR se nã
 ```bash
 curl -X POST http://<shared-alb-dns>/auth/token -H "Content-Type: application/json" \
   -d '{"serialNumber":"123456789"}'
-# esperado: 200 {"accessToken":"eyJ..."}
+# esperado: 200 {"accessToken":"eyJ..."} - decodificar o JWT e conferir
+# "typ":"ID" e "aud":"step-ca-oidc" (nao "typ":"Bearer"/"aud":"account")
 
 curl http://<shared-alb-dns>/public/ping
 # esperado: 200 {"status":"ok"}
@@ -87,4 +91,4 @@ curl --cert client.crt --key client.key https://<shared-alb-dns>:8443/consumer/p
 
 ## 8. Fora de escopo
 
-Spring Security / validação de token no próprio backend (quem valida certificados é o ALB/trust store, não o código Java); qualquer banco de dados; múltiplas réplicas; rate limiting; validação de força de senha (senha temporária é só um UUID/base64 aleatório).
+Spring Security / validação de token no próprio backend (quem valida certificados é o ALB/trust store, não o código Java); qualquer banco de dados; múltiplas réplicas; rate limiting; rotação/complexidade de senha (a senha derivada — `seed + serialNumber` — não segue nenhuma política de senha, é só uma credencial de máquina).

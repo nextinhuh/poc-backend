@@ -9,6 +9,16 @@ keycloak:
   # injetado via SSM (secrets do container ECS), nunca hardcoded em producao;
   # default so serve para rodar localmente contra um Keycloak de teste.
   backend-client-secret: ${KEYCLOAK_BACKEND_CLIENT_SECRET:poc-backend-secret-CHANGE-ME-not-sensitive-test-only}
+  # usado pra logar o terminal via Direct Access Grant (ver KeycloakService) -
+  # precisa ter Direct Access Grants habilitado no console do Keycloak.
+  stepca-client-id: step-ca-oidc
+  stepca-client-secret: ${KEYCLOAK_STEPCA_CLIENT_SECRET:step-ca-oidc-secret-CHANGE-ME-not-sensitive-test-only}
+
+terminal:
+  # seed usado pra derivar a senha de cada usuario-terminal (senha = seed +
+  # serialNumber) - gerado uma unica vez pelo Terraform, nunca digitado nem
+  # persistido em lugar nenhum alem dessa variavel de ambiente.
+  auth-seed: ${TERMINAL_AUTH_SEED:local-dev-only-seed-CHANGE-ME}
 
 logging:
   level:
