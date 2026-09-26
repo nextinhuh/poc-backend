@@ -3,6 +3,21 @@ resource "aws_cloudwatch_log_group" "backend" {
   retention_in_days = 3
 }
 
+# Seed usado pra derivar a senha de cada usuario-terminal no Keycloak
+# (senha = seed + serialNumber, ver KeycloakService.derivePassword). Gerado
+# uma unica vez pelo Terraform e guardado so como secret - nunca digitado/
+# versionado, nunca persistido pelo poc-backend em lugar nenhum alem daqui.
+resource "random_password" "terminal_auth_seed" {
+  length  = 64
+  special = false
+}
+
+resource "aws_ssm_parameter" "terminal_auth_seed" {
+  name  = "/${var.project_name}/backend/terminal-auth-seed"
+  type  = "SecureString"
+  value = random_password.terminal_auth_seed.result
+}
+
 resource "aws_ecs_task_definition" "backend" {
   family                   = "${var.project_name}-backend"
   requires_compatibilities = ["FARGATE"]
@@ -26,6 +41,14 @@ resource "aws_ecs_task_definition" "backend" {
         {
           name      = "KEYCLOAK_BACKEND_CLIENT_SECRET"
           valueFrom = data.aws_ssm_parameter.backend_client_secret.arn
+        },
+        {
+          name      = "KEYCLOAK_STEPCA_CLIENT_SECRET"
+          valueFrom = data.aws_ssm_parameter.stepca_client_secret.arn
+        },
+        {
+          name      = "TERMINAL_AUTH_SEED"
+          valueFrom = aws_ssm_parameter.terminal_auth_seed.arn
         }
       ]
 

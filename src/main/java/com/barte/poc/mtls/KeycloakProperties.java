@@ -7,5 +7,7 @@ public record KeycloakProperties(
         String baseUrl,
         String realm,
         String backendClientId,
-        String backendClientSecret) {
+        String backendClientSecret,
+        String stepcaClientId,
+        String stepcaClientSecret) {
 }

@@ -52,6 +52,14 @@ data "aws_ssm_parameter" "backend_client_secret" {
   with_decryption = true
 }
 
+# O poc-backend passou a logar o terminal diretamente como o client
+# step-ca-oidc (Direct Access Grant - ver KeycloakService.loginAsTerminal),
+# entao precisa do secret desse client tambem, nao so do proprio.
+data "aws_ssm_parameter" "stepca_client_secret" {
+  name            = "/${var.project_name}/keycloak/stepca-client-secret"
+  with_decryption = true
+}
+
 data "aws_ecr_repository" "this" {
   name = "${var.project_name}-backend"
 }
