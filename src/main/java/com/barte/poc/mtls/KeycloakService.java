@@ -1,7 +1,5 @@
 package com.barte.poc.mtls;
 
-import java.security.SecureRandom;
-import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -17,40 +15,40 @@ import org.springframework.web.client.RestTemplate;
 import org.springframework.web.util.UriComponentsBuilder;
 
 /**
- * Cria (se necessario) o usuario no realm poc-terminal e emite um token para
- * ele.
+ * Cria (se necessario) o usuario-terminal no realm poc-terminal - username =
+ * serial number do hardware, sem senha - e emite um token para ele via OAuth2
+ * Token Exchange (RFC 8693), impersonando o usuario com a identidade do
+ * proprio client poc-backend (client_credentials). Ver README, secao "papel
+ * deste servico", para o passo a passo de configuracao do realm que isso
+ * exige (feature token-exchange, permissoes Users->impersonate e
+ * Clients->poc-backend->token-exchange).
  *
- * IMPORTANTE (ver README, secao "papel deste servico"): o step-ca valida um
- * ID Token OIDC (JWT assinado pelo Keycloak), nao um access_token opaco. Por
- * isso pedimos scope=openid e devolvemos o campo id_token da resposta do
- * Keycloak como "access_token" no contrato deste endpoint - o nome do campo
- * segue a nomenclatura combinada entre os 4 repositorios, mas o valor
- * precisa ser o id_token, senao o step-ca rejeita na hora de assinar o CSR.
+ * IMPORTANTE: o step-ca valida um ID Token OIDC (JWT assinado pelo Keycloak),
+ * nao um access_token opaco. Por isso pedimos scope=openid no exchange e
+ * devolvemos o campo id_token da resposta como "accessToken" no contrato
+ * deste endpoint.
  */
 @Service
 public class KeycloakService {
 
     private final RestTemplate restTemplate;
     private final KeycloakProperties properties;
-    private final SecureRandom random = new SecureRandom();
 
     public KeycloakService(RestTemplate restTemplate, KeycloakProperties properties) {
         this.restTemplate = restTemplate;
         this.properties = properties;
     }
 
-    public String issueTokenForEmail(String email) {
-        String adminAccessToken = fetchAdminAccessToken();
-        String userId = findUserIdByEmail(email, adminAccessToken)
-                .orElseGet(() -> createUser(email, adminAccessToken));
+    public String issueTokenForSerialNumber(String serialNumber) {
+        String serviceAccountToken = fetchServiceAccountToken();
 
-        String temporaryPassword = generateTemporaryPassword();
-        resetUserPassword(userId, temporaryPassword, adminAccessToken);
+        findUserIdByUsername(serialNumber, serviceAccountToken)
+                .orElseGet(() -> createUser(serialNumber, serviceAccountToken));
 
-        return issueUserIdToken(email, temporaryPassword);
+        return exchangeTokenForSubject(serviceAccountToken, serialNumber);
     }
 
-    private String fetchAdminAccessToken() {
+    private String fetchServiceAccountToken() {
         MultiValueMap<String, String> form = new LinkedMultiValueMap<>();
         form.add("grant_type", "client_credentials");
         form.add("client_id", properties.backendClientId());
@@ -60,16 +58,16 @@ public class KeycloakService {
         return (String) response.get("access_token");
     }
 
-    private Optional<String> findUserIdByEmail(String email, String adminAccessToken) {
+    private Optional<String> findUserIdByUsername(String username, String serviceAccountToken) {
         String url = UriComponentsBuilder
                 .fromHttpUrl(properties.baseUrl())
                 .path("/admin/realms/{realm}/users")
-                .queryParam("email", email)
+                .queryParam("username", username)
                 .queryParam("exact", true)
                 .buildAndExpand(properties.realm())
                 .toUriString();
 
-        HttpHeaders headers = bearerHeaders(adminAccessToken);
+        HttpHeaders headers = bearerHeaders(serviceAccountToken);
         var response = restTemplate.exchange(url, HttpMethod.GET, new HttpEntity<>(headers), List.class);
         List<Map<String, Object>> users = response.getBody();
 
@@ -79,57 +77,42 @@ public class KeycloakService {
         return Optional.of((String) users.get(0).get("id"));
     }
 
-    private String createUser(String email, String adminAccessToken) {
+    private String createUser(String serialNumber, String serviceAccountToken) {
         String url = UriComponentsBuilder
                 .fromHttpUrl(properties.baseUrl())
                 .path("/admin/realms/{realm}/users")
                 .buildAndExpand(properties.realm())
                 .toUriString();
 
+        // Sem email, sem credentials - o terminal nunca faz login com senha,
+        // so e alvo de token exchange feito pelo poc-backend.
         Map<String, Object> body = Map.of(
-                "username", email,
-                "email", email,
-                "enabled", true,
-                "emailVerified", true);
+                "username", serialNumber,
+                "enabled", true);
 
-        HttpHeaders headers = bearerHeaders(adminAccessToken);
+        HttpHeaders headers = bearerHeaders(serviceAccountToken);
         headers.setContentType(MediaType.APPLICATION_JSON);
         restTemplate.exchange(url, HttpMethod.POST, new HttpEntity<>(body, headers), Void.class);
 
         // Keycloak nao devolve o id no corpo do POST (retorna so o header
         // Location) - buscamos de novo por simplicidade.
-        return findUserIdByEmail(email, adminAccessToken)
-                .orElseThrow(() -> new IllegalStateException("Usuario " + email + " nao encontrado logo apos criacao"));
+        return findUserIdByUsername(serialNumber, serviceAccountToken)
+                .orElseThrow(() -> new IllegalStateException(
+                        "Terminal " + serialNumber + " nao encontrado logo apos criacao"));
     }
 
-    private void resetUserPassword(String userId, String password, String adminAccessToken) {
-        String url = UriComponentsBuilder
-                .fromHttpUrl(properties.baseUrl())
-                .path("/admin/realms/{realm}/users/{userId}/reset-password")
-                .buildAndExpand(properties.realm(), userId)
-                .toUriString();
-
-        Map<String, Object> body = Map.of(
-                "type", "password",
-                "value", password,
-                "temporary", false);
-
-        HttpHeaders headers = bearerHeaders(adminAccessToken);
-        headers.setContentType(MediaType.APPLICATION_JSON);
-        restTemplate.exchange(url, HttpMethod.PUT, new HttpEntity<>(body, headers), Void.class);
-    }
-
-    private String issueUserIdToken(String email, String password) {
+    private String exchangeTokenForSubject(String serviceAccountToken, String serialNumber) {
         MultiValueMap<String, String> form = new LinkedMultiValueMap<>();
-        form.add("grant_type", "password");
+        form.add("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange");
         form.add("client_id", properties.backendClientId());
         form.add("client_secret", properties.backendClientSecret());
-        form.add("username", email);
-        form.add("password", password);
+        form.add("subject_token", serviceAccountToken);
+        form.add("requested_subject", serialNumber);
         form.add("scope", "openid");
 
         Map<String, Object> response = postForm(tokenEndpoint(), form);
-        return (String) response.get("id_token");
+        Object idToken = response.get("id_token");
+        return idToken != null ? (String) idToken : (String) response.get("access_token");
     }
 
     private Map<String, Object> postForm(String url, MultiValueMap<String, String> form) {
@@ -150,11 +133,5 @@ public class KeycloakService {
         HttpHeaders headers = new HttpHeaders();
         headers.setBearerAuth(accessToken);
         return headers;
-    }
-
-    private String generateTemporaryPassword() {
-        byte[] bytes = new byte[24];
-        random.nextBytes(bytes);
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
     }
 }

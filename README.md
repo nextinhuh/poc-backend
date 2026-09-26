@@ -4,7 +4,7 @@
 
 Esta é uma POC pessoal (conta AWS pessoal do autor, fora da empresa) para validar, antes de propor formalmente para a empresa Barte, se o desenho de autenticação de terminais via **step-ca + Keycloak + ALB com listener mTLS** funciona de ponta a ponta:
 
-1. Um cliente pede um token a **este serviço**, informando só um e-mail.
+1. Um cliente (terminal POS) pede um token a **este serviço**, informando o serial number do hardware.
 2. O cliente gera um CSR local e manda `{csr, access_token}` para o step-ca, que valida o token contra o Keycloak e assina, devolvendo um certificado x509.
 3. O cliente usa esse certificado para chamar um endpoint **deste serviço** só acessível através de um listener **mTLS** do ALB.
 
@@ -13,15 +13,17 @@ Simplificado em relação ao plano corporativo real: sem domínio próprio, sem 
 ## 2. Papel deste serviço (poc-backend)
 
 É o único serviço com lógica de negócio própria (Spring Boot). Expõe 3 endpoints atrás do ALB compartilhado:
-- `POST /auth/token` — porta 80 (HTTP), cria/reseta o usuário no Keycloak e devolve um token.
+- `POST /auth/token` — porta 80 (HTTP), recebe o `serialNumber` do terminal, cria o usuário no Keycloak se necessário (username = serial number, **sem senha**) e devolve um token via **OAuth2 Token Exchange** (RFC 8693).
 - `GET /public/ping` — porta 80 (HTTP), sempre 200, sem exigir nada (prova que a porta "normal" funciona).
 - `GET /consumer/ping` — só acessível pelo listener **mTLS** (8443); no listener 80 esse path é explicitamente bloqueado (404 fixo) pelo Terraform deste repositório.
 
 Fala com o Keycloak sempre via Cloud Map (`http://keycloak.poc-mtls.local:8080`), nunca por IP.
 
-**Detalhe crítico de implementação (não pular)**: o step-ca valida um **ID Token OIDC** (JWT assinado pelo Keycloak), não um `access_token` opaco. Por isso `/auth/token` precisa pedir o token ao Keycloak com `scope=openid` e devolver o campo **`id_token`** da resposta do Keycloak no campo `accessToken`/`access_token` do contrato deste endpoint. Se devolver o `access_token` "de verdade" do Keycloak em vez do `id_token`, o step-ca vai rejeitar a assinatura do CSR. Ver `KeycloakService.issueUserIdToken`.
+**Detalhe crítico de implementação (não pular)**: o step-ca valida um **ID Token OIDC** (JWT assinado pelo Keycloak), não um `access_token` opaco. Por isso `/auth/token` precisa pedir o token ao Keycloak com `scope=openid` e devolver o campo **`id_token`** da resposta do Keycloak no campo `accessToken`/`access_token` do contrato deste endpoint (com fallback pro `access_token` caso o `id_token` não venha). Se devolver o `access_token` "de verdade" do Keycloak em vez do `id_token`, o step-ca vai rejeitar a assinatura do CSR. Ver `KeycloakService.exchangeTokenForSubject`.
 
-Como o usuário é criado sem senha, e emitir token via `direct-access-grants` (`grant_type=password`) exige uma senha, o serviço gera uma senha temporária aleatória, faz `PUT /admin/.../reset-password` com ela, e na sequência pede o token com essa mesma senha — tudo dentro da mesma chamada a `/auth/token`, de forma transparente pro cliente.
+Cada terminal é modelado como **1 usuário único no Keycloak, sem senha nunca** — o `poc-backend` nunca autentica como o terminal (não existe `grant_type=password` nesse fluxo). Em vez disso: (1) o backend pega seu **próprio token** via `client_credentials` (usado tanto pra chamar a Admin API quanto como `subject_token`); (2) cria o usuário-terminal se ele ainda não existir (`findUserIdByUsername`/`createUser`, sem `email`/`credentials`); (3) troca esse token pelo do usuário-terminal via `grant_type=urn:ietf:params:oauth:grant-type:token-exchange` + `requested_subject=<serialNumber>` — é o "impersonate" via token exchange, não o Admin Impersonation API (são mecanismos diferentes, ver histórico de troubleshooting deste projeto).
+
+**Pré-requisito de configuração no Keycloak (feito manualmente no console, documentado aqui pra não se perder)**: o realm `poc-terminal` precisa ter a feature `token-exchange` habilitada no servidor (`Dockerfile` do `poc-keycloak`, flag `--features=token-exchange,admin-fine-grained-authz`), e duas permissões configuradas: `Clients → poc-backend → Advanced → Permissions enabled` + a permissão `token-exchange` desse client com uma policy liberando o próprio `poc-backend`; e `Users → Permissions → impersonate` com a mesma policy. Sem isso, o Keycloak recusa com `{"error":"access_denied","error_description":"Client not allowed to exchange"}`.
 
 ## 3. Contrato entre serviços (fonte de verdade — igual nos 3 READMEs)
 
@@ -49,9 +51,9 @@ Como o usuário é criado sem senha, e emitir token via `direct-access-grants` (
 ## 4. O que precisa ser implementado aqui
 
 Já implementado neste repositório (Spring Boot 3 / Java 17 / Maven, sem Spring Security — desnecessário para o escopo):
-- `AuthController` — `POST /auth/token`, recebe `{"email": "..."}`, devolve `{"accessToken": "<id_token do Keycloak>"}`.
+- `AuthController` — `POST /auth/token`, recebe `{"serialNumber": "..."}`, devolve `{"accessToken": "<id_token do Keycloak>"}`.
 - `PingController` — `GET /public/ping` (sempre 200) e `GET /consumer/ping` (ecoa o header `X-Amzn-Mtls-Clientcert-Subject` que o ALB injeta quando o mutual TLS é validado).
-- `KeycloakService` — `fetchAdminAccessToken` (client_credentials), `findUserIdByEmail`/`createUser` (Admin REST API), `resetUserPassword`, `issueUserIdToken` (grant `password`, `scope=openid`, lê `id_token` da resposta).
+- `KeycloakService` — `fetchServiceAccountToken` (client_credentials), `findUserIdByUsername`/`createUser` (Admin REST API, sem email/credentials), `exchangeTokenForSubject` (grant `urn:ietf:params:oauth:grant-type:token-exchange`, `requested_subject=<serialNumber>`, `scope=openid`, lê `id_token` da resposta com fallback pra `access_token`).
 - `terraform/ecs.tf` — task definition (env `KEYCLOAK_BASE_URL`, secret `KEYCLOAK_BACKEND_CLIENT_SECRET` do SSM), 2 target groups (`backend-public-tg`, `backend-consumer-tg`), service com os 2 `load_balancer` blocks.
 - `terraform/alb-rules.tf` — regra no listener 80 para `/auth/token` + `/public/ping` → target group público; regra de bloqueio (404) para `/consumer/*` no listener 80; regra no listener 8443 (mTLS) para `/consumer/*` → target group consumer.
 
@@ -70,7 +72,7 @@ Em push na `main`: assume a IAM role via OIDC → cria o repositório ECR se nã
 
 ```bash
 curl -X POST http://<shared-alb-dns>/auth/token -H "Content-Type: application/json" \
-  -d '{"email":"teste@example.com"}'
+  -d '{"serialNumber":"123456789"}'
 # esperado: 200 {"accessToken":"eyJ..."}
 
 curl http://<shared-alb-dns>/public/ping
