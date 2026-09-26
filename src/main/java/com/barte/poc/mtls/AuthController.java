@@ -1,0 +1,35 @@
+package com.barte.poc.mtls;
+
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RestController;
+
+/**
+ * Endpoint publico (porta 80, listener HTTP do ALB compartilhado). Recebe so
+ * um e-mail, cria o usuario no Keycloak se necessario, e devolve um token
+ * pronto para ser usado no POST /1.0/sign do step-ca.
+ */
+@RestController
+public class AuthController {
+
+    public record TokenRequest(String email) {
+    }
+
+    public record TokenResponse(String accessToken) {
+    }
+
+    private final KeycloakService keycloakService;
+
+    public AuthController(KeycloakService keycloakService) {
+        this.keycloakService = keycloakService;
+    }
+
+    @PostMapping("/auth/token")
+    public TokenResponse issueToken(@RequestBody TokenRequest request) {
+        if (request.email() == null || request.email().isBlank()) {
+            throw new IllegalArgumentException("email e obrigatorio");
+        }
+        String token = keycloakService.issueTokenForEmail(request.email());
+        return new TokenResponse(token);
+    }
+}

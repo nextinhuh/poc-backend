@@ -1,0 +1,15 @@
+server:
+  port: 8080
+
+keycloak:
+  # http://keycloak.poc-mtls.local:8080 dentro da VPC (Cloud Map) - ver README
+  base-url: ${KEYCLOAK_BASE_URL:http://keycloak.poc-mtls.local:8080}
+  realm: poc-terminal
+  backend-client-id: poc-backend
+  # injetado via SSM (secrets do container ECS), nunca hardcoded em producao;
+  # default so serve para rodar localmente contra um Keycloak de teste.
+  backend-client-secret: ${KEYCLOAK_BACKEND_CLIENT_SECRET:poc-backend-secret-CHANGE-ME-not-sensitive-test-only}
+
+logging:
+  level:
+    com.barte.poc: INFO
