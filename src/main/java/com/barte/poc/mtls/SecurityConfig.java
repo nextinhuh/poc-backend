@@ -17,8 +17,8 @@ import org.springframework.security.oauth2.core.OAuth2TokenValidator;
 import org.springframework.security.oauth2.core.OAuth2TokenValidatorResult;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.security.oauth2.jwt.JwtDecoder;
-import org.springframework.security.oauth2.jwt.JwtDecoders;
 import org.springframework.security.oauth2.jwt.JwtValidators;
+import org.springframework.security.oauth2.jwt.NimbusJwtDecoder;
 import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationConverter;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.core.convert.converter.Converter;
@@ -91,11 +91,25 @@ public class SecurityConfig {
      * audience: so aceita token emitido para o client "step-ca-oidc" (o
      * mesmo usado pra assinar o certificado) - defesa em profundidade, evita
      * que qualquer JWT valido de outro client do mesmo Keycloak passe aqui.
+     *
+     * Importante: usamos withJwkSetUri (nao JwtDecoders.fromIssuerLocation)
+     * de proposito. fromIssuerLocation busca o discovery endpoint
+     * (/.well-known/openid-configuration) de forma sincrona na CRIACAO deste
+     * bean - ou seja, no boot da aplicacao - e se o Keycloak nao estiver
+     * acessivel exatamente nesse instante (ordem de start das tasks ECS,
+     * Cloud Map ainda propagando, etc.), a aplicacao inteira falha ao subir
+     * (erro real ja visto: "Unable to resolve the Configuration with the
+     * provided Issuer"). Com withJwkSetUri, a URL do JWKS e montada na mao
+     * (path fixo do Keycloak) e a busca so acontece na primeira validacao de
+     * token de verdade (cacheada depois) - um Keycloak fora do ar no boot
+     * derruba a primeira request que precisar dele (401), nao a aplicacao.
      */
     @Bean
     JwtDecoder jwtDecoder() {
         String issuerUri = keycloakProperties.issuer();
-        var decoder = (org.springframework.security.oauth2.jwt.NimbusJwtDecoder) JwtDecoders.fromIssuerLocation(issuerUri);
+        String jwkSetUri = issuerUri + "/protocol/openid-connect/certs";
+
+        NimbusJwtDecoder decoder = NimbusJwtDecoder.withJwkSetUri(jwkSetUri).build();
 
         OAuth2TokenValidator<Jwt> withIssuer = JwtValidators.createDefaultWithIssuer(issuerUri);
         OAuth2TokenValidator<Jwt> withAudience = jwt -> jwt.getAudience().contains(keycloakProperties.stepcaClientId())
