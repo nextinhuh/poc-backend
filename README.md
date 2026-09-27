@@ -27,6 +27,10 @@ Fala com o Keycloak sempre via Cloud Map (`http://keycloak.poc-mtls.local:8080`)
 
 **Pré-requisito de configuração no Keycloak**: o client `step-ca-oidc` precisa ter **Direct Access Grants habilitado** — sem isso o Keycloak recusa o grant `password`. E o Keycloak exige `email`/`firstName`/`lastName` preenchidos no usuário para considerar a conta "completa" — sem isso o login falha com `{"error":"invalid_grant","error_description":"Account is not fully set up"}` (erro real encontrado ao validar este fluxo, nada a ver com a senha em si).
 
+**Dupla validação no `/consumer/ping` (mTLS + token)**: além do certificado cliente (validado pelo trust store do ALB, listener 8443), o `/consumer/ping` agora também exige um header `Authorization: Bearer <id_token>` válido — o mesmo `id_token` usado pra assinar o certificado em `/1.0/sign`. A validação é feita pelo Spring Security **OAuth2 Resource Server** (`SecurityConfig`), que busca o JWKS do Keycloak via `issuer-uri` e cacheia localmente (mesma estratégia "sem chamada por request" que o step-ca já usa pro `ott`) — confere assinatura, `iss`, `exp`, e adicionalmente `aud` (precisa conter `step-ca-oidc`, defesa em profundidade). Sem esse header (ou com token expirado/inválido), a resposta é `401` antes mesmo de chegar no controller. `/public/ping` e `/auth/token` continuam sem exigir token.
+
+⚠️ O `id_token` e o certificado x509 têm TTLs curtos e **independentes** — se você gerar o token, assinar o CSR, e demorar pra testar `/consumer/ping`, o token pode expirar mesmo com o certificado ainda válido. Peça um token novo em `/auth/token` próximo da hora do teste.
+
 ## 3. Contrato entre serviços (fonte de verdade — igual nos 3 READMEs)
 
 | Item | Valor exato |
@@ -56,8 +60,9 @@ Fala com o Keycloak sempre via Cloud Map (`http://keycloak.poc-mtls.local:8080`)
 
 Já implementado neste repositório (Spring Boot 3 / Java 17 / Maven, sem Spring Security — desnecessário para o escopo):
 - `AuthController` — `POST /auth/token`, recebe `{"serialNumber": "..."}`, devolve `{"accessToken": "<id_token do Keycloak>"}`.
-- `PingController` — `GET /public/ping` (sempre 200) e `GET /consumer/ping` (ecoa o header `X-Amzn-Mtls-Clientcert-Subject` que o ALB injeta quando o mutual TLS é validado).
+- `PingController` — `GET /public/ping` (sempre 200) e `GET /consumer/ping` (ecoa o header `X-Amzn-Mtls-Clientcert-Subject` que o ALB injeta quando o mutual TLS é validado, e o `sub` do JWT já validado pelo Resource Server).
 - `KeycloakService` — `fetchServiceAccountToken` (client_credentials, só pra Admin API), `findUserIdByUsername`/`createUser` (Admin REST API, com `firstName`/`lastName`/`email` mock e senha derivada), `derivePassword` (`seed + serialNumber`), `loginAsTerminal` (`grant_type=password` contra o client `step-ca-oidc`, `scope=openid`, lê `id_token` da resposta).
+- `SecurityConfig` — OAuth2 Resource Server: exige Bearer token válido em `/consumer/**` (`/public/ping` e `/auth/token` continuam livres); `JwtDecoder` customizado adiciona validação de `aud=step-ca-oidc` em cima da validação padrão (assinatura via JWKS, `iss`, `exp`).
 - `terraform/ecs.tf` — task definition (env `KEYCLOAK_BASE_URL`, secrets `KEYCLOAK_BACKEND_CLIENT_SECRET`/`KEYCLOAK_STEPCA_CLIENT_SECRET`/`TERMINAL_AUTH_SEED` do SSM — o último gerado pelo próprio Terraform via `random_password`), 2 target groups (`backend-public-tg`, `backend-consumer-tg`), service com os 2 `load_balancer` blocks.
 - `terraform/alb-rules.tf` — regra no listener 80 para `/auth/token` + `/public/ping` → target group público; regra de bloqueio (404) para `/consumer/*` no listener 80; regra no listener 8443 (mTLS) para `/consumer/*` → target group consumer.
 
@@ -67,7 +72,7 @@ Já implementado neste repositório (Spring Boot 3 / Java 17 / Maven, sem Spring
 
 - Consome: `/poc-mtls/keycloak/backend-client-secret` e `/poc-mtls/keycloak/stepca-client-secret` (SSM SecureString, escritos pelo `poc-keycloak`).
 - Produz: `/poc-mtls/backend/terminal-auth-seed` (SSM SecureString, gerado pelo próprio Terraform deste repo via `random_password` — ninguém digita/versiona esse valor em lugar nenhum).
-- Env vars do container: `KEYCLOAK_BASE_URL=http://keycloak.poc-mtls.local:8080` (fixo), `KEYCLOAK_BACKEND_CLIENT_SECRET`, `KEYCLOAK_STEPCA_CLIENT_SECRET`, `TERMINAL_AUTH_SEED` (os 3 últimos via secret SSM).
+- Env vars do container: `KEYCLOAK_BASE_URL=http://keycloak.poc-mtls.local:8080` (fixo), `KEYCLOAK_ISSUER=http://keycloak.poc-mtls.local:8080/realms/poc-terminal` (fixo — usado pelo Resource Server pra validar o Bearer token do `/consumer/ping`, mesmo issuer que o `poc-certificate` já usa pro `ott`), `KEYCLOAK_BACKEND_CLIENT_SECRET`, `KEYCLOAK_STEPCA_CLIENT_SECRET`, `TERMINAL_AUTH_SEED` (os 3 últimos via secret SSM).
 
 ## 6. Workflow de CI/CD (`.github/workflows/deploy.yml`)
 
@@ -95,8 +100,15 @@ curl -i http://<shared-alb-dns>/consumer/ping
 cat crt.pem ca.pem > chain.pem
 
 curl --cert chain.pem --key client.key https://<shared-alb-dns>:8443/consumer/ping
-# esperado (depois de ter um certificado valido emitido pelo step-ca): 200
-# {"status":"ok","cert_subject":"CN=<uuid-do-usuario-no-keycloak>"}
+# sem Authorization: Bearer, mesmo com certificado valido: 401 (nova
+# validacao de token, ver SecurityConfig)
+
+curl --cert chain.pem --key client.key \
+  -H "Authorization: Bearer ${TOKEN}" \
+  https://<shared-alb-dns>:8443/consumer/ping
+# esperado (certificado valido + token valido, mesmo id_token usado no
+# /1.0/sign): 200
+# {"status":"ok","cert_subject":"CN=<uuid-do-usuario-no-keycloak>","token_subject":"<mesmo uuid>"}
 # repare que o cert_subject NAO e o serialNumber - o step-ca usa o "sub" do
 # id_token (o id interno do usuario no Keycloak) como identidade do
 # certificado, ignorando o CN pedido no CSR. Se precisar recuperar o serial

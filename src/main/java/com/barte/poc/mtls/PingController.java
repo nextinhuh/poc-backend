@@ -2,6 +2,8 @@ package com.barte.poc.mtls;
 
 import java.util.Map;
 
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RestController;
@@ -26,12 +28,18 @@ public class PingController {
      * X-Amzn-Mtls-Clientcert-Subject quando o mutual_authentication esta em
      * modo "verify" - so ecoamos esse valor, sem validacao adicional (a
      * validacao real e feita pelo trust store do ALB).
+     *
+     * Segunda camada: alem do mTLS, o SecurityConfig exige um Bearer token
+     * valido (assinatura/iss/exp/aud verificados via JWKS do Keycloak) -
+     * sem isso a request nem chega aqui (401 antes do controller).
      */
     @GetMapping("/consumer/ping")
     public Map<String, String> consumerPing(
-            @RequestHeader(value = "X-Amzn-Mtls-Clientcert-Subject", required = false) String certSubject) {
+            @RequestHeader(value = "X-Amzn-Mtls-Clientcert-Subject", required = false) String certSubject,
+            @AuthenticationPrincipal Jwt jwt) {
         return Map.of(
                 "status", "ok",
-                "cert_subject", certSubject == null ? "desconhecido" : certSubject);
+                "cert_subject", certSubject == null ? "desconhecido" : certSubject,
+                "token_subject", jwt.getSubject());
     }
 }

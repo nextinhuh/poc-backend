@@ -13,6 +13,16 @@ keycloak:
   # precisa ter Direct Access Grants habilitado no console do Keycloak.
   stepca-client-id: step-ca-oidc
   stepca-client-secret: ${KEYCLOAK_STEPCA_CLIENT_SECRET:step-ca-oidc-secret-CHANGE-ME-not-sensitive-test-only}
+  # mesmo issuer que o poc-certificate ja usa pra validar o "ott" - usado
+  # aqui pra validar o Bearer token do /consumer/ping (ver SecurityConfig).
+  issuer: ${KEYCLOAK_ISSUER:http://keycloak.poc-mtls.local:8080/realms/poc-terminal}
+
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: ${keycloak.issuer}
 
 terminal:
   # seed usado pra derivar a senha de cada usuario-terminal (senha = seed +

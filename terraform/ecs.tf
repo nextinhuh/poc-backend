@@ -35,6 +35,10 @@ resource "aws_ecs_task_definition" "backend" {
 
       environment = [
         { name = "KEYCLOAK_BASE_URL", value = "http://keycloak.${var.project_name}.local:8080" },
+        # usado pelo SecurityConfig (Resource Server) pra validar o Bearer
+        # token do /consumer/ping - mesmo issuer que o poc-certificate ja
+        # usa pra validar o "ott" no provisioner OIDC do step-ca.
+        { name = "KEYCLOAK_ISSUER", value = "http://keycloak.${var.project_name}.local:8080/realms/poc-terminal" },
       ]
 
       secrets = [

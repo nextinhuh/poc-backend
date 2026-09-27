@@ -9,5 +9,6 @@ public record KeycloakProperties(
         String backendClientId,
         String backendClientSecret,
         String stepcaClientId,
-        String stepcaClientSecret) {
+        String stepcaClientSecret,
+        String issuer) {
 }
