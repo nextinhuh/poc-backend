@@ -10,6 +10,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.oauth2.jwt.JwtDecoder;
 import org.springframework.test.web.servlet.MockMvc;
 
@@ -47,6 +48,35 @@ class ConsumerPingSecurityTest {
     @Test
     void publicPingContinuaSemExigirToken() throws Exception {
         mockMvc.perform(get("/public/ping"))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    void terminalPodeComRoleCertaRetorna200() throws Exception {
+        mockMvc.perform(get("/consumer/terminal-pode/ping")
+                        .with(jwt().authorities(new SimpleGrantedAuthority("ROLE_terminal_pode"))))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    void terminalPodeSemRoleRetorna403() throws Exception {
+        mockMvc.perform(get("/consumer/terminal-pode/ping").with(jwt()))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
+    void terminalNaoPodeComRoleTerminalPodeRetorna403() throws Exception {
+        // prova que os dois endpoints exigem roles diferentes - ter
+        // "terminal_pode" nao da acesso ao endpoint de "terminal_nao_pode".
+        mockMvc.perform(get("/consumer/terminal-nao-pode/ping")
+                        .with(jwt().authorities(new SimpleGrantedAuthority("ROLE_terminal_pode"))))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
+    void terminalNaoPodeComRoleCertaRetorna200() throws Exception {
+        mockMvc.perform(get("/consumer/terminal-nao-pode/ping")
+                        .with(jwt().authorities(new SimpleGrantedAuthority("ROLE_terminal_nao_pode"))))
                 .andExpect(status().isOk());
     }
 }

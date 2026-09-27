@@ -1,11 +1,16 @@
 package com.barte.poc.mtls;
 
+import java.util.List;
+import java.util.Map;
+
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.security.authentication.AbstractAuthenticationToken;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
-import org.springframework.security.config.Customizer;
 import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.core.GrantedAuthority;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.oauth2.core.DelegatingOAuth2TokenValidator;
 import org.springframework.security.oauth2.core.OAuth2Error;
 import org.springframework.security.oauth2.core.OAuth2TokenValidator;
@@ -14,7 +19,9 @@ import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.security.oauth2.jwt.JwtDecoder;
 import org.springframework.security.oauth2.jwt.JwtDecoders;
 import org.springframework.security.oauth2.jwt.JwtValidators;
+import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationConverter;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.core.convert.converter.Converter;
 
 /**
  * Segunda camada de validacao do /consumer/ping, alem do mTLS ja validado
@@ -43,10 +50,40 @@ public class SecurityConfig {
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(auth -> auth
                         .requestMatchers("/public/ping", "/auth/token").permitAll()
+                        // regras mais especificas antes da generica /consumer/** -
+                        // ordem importa no authorizeHttpRequests.
+                        .requestMatchers("/consumer/terminal-pode/**").hasRole("terminal_pode")
+                        .requestMatchers("/consumer/terminal-nao-pode/**").hasRole("terminal_nao_pode")
                         .requestMatchers("/consumer/**").authenticated()
                         .anyRequest().denyAll())
-                .oauth2ResourceServer(oauth2 -> oauth2.jwt(Customizer.withDefaults()));
+                .oauth2ResourceServer(oauth2 -> oauth2.jwt(jwt -> jwt.jwtAuthenticationConverter(jwtAuthenticationConverter())));
         return http.build();
+    }
+
+    /**
+     * O Spring, por padrao, so olha o claim "scope"/"scp" pra montar
+     * authorities - nao e assim que o Keycloak representa roles. Aqui
+     * extraimos "realm_access.roles" do token (injetado automaticamente
+     * pelo client scope "roles", default em qualquer client) e viramos
+     * GrantedAuthority com o prefixo ROLE_, que e o que hasRole(...) espera.
+     */
+    @Bean
+    Converter<Jwt, AbstractAuthenticationToken> jwtAuthenticationConverter() {
+        Converter<Jwt, java.util.Collection<GrantedAuthority>> realmRolesConverter = jwt -> {
+            Map<String, Object> realmAccess = jwt.getClaimAsMap("realm_access");
+            if (realmAccess == null) {
+                return List.of();
+            }
+            @SuppressWarnings("unchecked")
+            List<String> roles = (List<String>) realmAccess.getOrDefault("roles", List.of());
+            return roles.stream()
+                    .map(role -> (GrantedAuthority) new SimpleGrantedAuthority("ROLE_" + role))
+                    .toList();
+        };
+
+        JwtAuthenticationConverter converter = new JwtAuthenticationConverter();
+        converter.setJwtGrantedAuthoritiesConverter(realmRolesConverter);
+        return converter;
     }
 
     /**

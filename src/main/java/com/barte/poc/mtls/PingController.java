@@ -42,4 +42,28 @@ public class PingController {
                 "cert_subject", certSubject == null ? "desconhecido" : certSubject,
                 "token_subject", jwt.getSubject());
     }
+
+    /**
+     * Terceira camada, alem de mTLS + token valido: exige o realm role
+     * "terminal_pode" (ver SecurityConfig.filterChain) - o role e atribuido
+     * automaticamente a todo terminal via default-roles-poc-terminal
+     * (configuracao manual no console do Keycloak, ver README do
+     * poc-keycloak). Sem o role, o Spring Security ja devolve 403 antes de
+     * chegar aqui.
+     */
+    @GetMapping("/consumer/terminal-pode/ping")
+    public Map<String, String> terminalPode(@AuthenticationPrincipal Jwt jwt) {
+        return Map.of("status", "ok", "token_subject", jwt.getSubject());
+    }
+
+    /**
+     * Espelho do endpoint acima, exigindo "terminal_nao_pode" - de proposito
+     * nenhum terminal tem esse role (nao esta em default-roles-poc-terminal),
+     * entao esse endpoint serve como prova de que a autorizacao por role
+     * realmente bloqueia quem nao deveria passar.
+     */
+    @GetMapping("/consumer/terminal-nao-pode/ping")
+    public Map<String, String> terminalNaoPode(@AuthenticationPrincipal Jwt jwt) {
+        return Map.of("status", "ok", "token_subject", jwt.getSubject());
+    }
 }

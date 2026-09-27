@@ -31,6 +31,12 @@ Fala com o Keycloak sempre via Cloud Map (`http://keycloak.poc-mtls.local:8080`)
 
 ⚠️ O `id_token` e o certificado x509 têm TTLs curtos e **independentes** — se você gerar o token, assinar o CSR, e demorar pra testar `/consumer/ping`, o token pode expirar mesmo com o certificado ainda válido. Peça um token novo em `/auth/token` próximo da hora do teste.
 
+**Terceira camada, por endpoint: autorização por realm role.** Além de mTLS + token válido, dois endpoints extras exigem um realm role específico do Keycloak (`realm_access.roles` do JWT, mapeado em `SecurityConfig.jwtAuthenticationConverter`):
+- `GET /consumer/terminal-pode/ping` — exige o role `terminal_pode`.
+- `GET /consumer/terminal-nao-pode/ping` — exige o role `terminal_nao_pode`.
+
+Esses roles **não são atribuídos pelo `poc-backend`** — a ideia é provar que dá pra fazer isso 100% do lado do Keycloak, via o composite `default-roles-poc-terminal` (todo usuário novo do realm herda automaticamente os roles associados a ele). Ver README do `poc-keycloak`, seção 8.9, para a configuração manual: `terminal_pode` é associado ao default role (todo terminal novo ganha), `terminal_nao_pode` não é associado a nada (nenhum terminal deveria ter esse role — o endpoint existe só pra provar que a autorização bloqueia quem não tem o role certo). Sem o role certo, a resposta é `403` (diferente do `401` de token ausente/inválido).
+
 ## 3. Contrato entre serviços (fonte de verdade — igual nos 3 READMEs)
 
 | Item | Valor exato |
@@ -50,7 +56,7 @@ Fala com o Keycloak sempre via Cloud Map (`http://keycloak.poc-mtls.local:8080`)
 | Cluster ECS | `data "aws_ecs_cluster" "this"` — nome fixo `poc-mtls-ECS` |
 | Namespace Cloud Map | `poc-mtls.local` |
 | Porta/health-check step-ca | `9000` (HTTPS interno), `GET /health` |
-| Porta backend | `8080`; paths `/auth/token` (POST), `/public/ping` (GET), `/consumer/ping` (GET) |
+| Porta backend | `8080`; paths `/auth/token` (POST), `/public/ping` (GET), `/consumer/ping` (GET), `/consumer/terminal-pode/ping` (GET), `/consumer/terminal-nao-pode/ping` (GET) |
 | Path público do step-ca no ALB | `/1.0/sign` (POST), `/health` (GET) — listener 80 |
 | Path bloqueado no listener 80 | `/consumer/*` → fixed-response 404 |
 | Path liberado só no listener 8443 (mTLS) | `/consumer/*` → target group backend |
@@ -60,9 +66,9 @@ Fala com o Keycloak sempre via Cloud Map (`http://keycloak.poc-mtls.local:8080`)
 
 Já implementado neste repositório (Spring Boot 3 / Java 17 / Maven, sem Spring Security — desnecessário para o escopo):
 - `AuthController` — `POST /auth/token`, recebe `{"serialNumber": "..."}`, devolve `{"accessToken": "<id_token do Keycloak>"}`.
-- `PingController` — `GET /public/ping` (sempre 200) e `GET /consumer/ping` (ecoa o header `X-Amzn-Mtls-Clientcert-Subject` que o ALB injeta quando o mutual TLS é validado, e o `sub` do JWT já validado pelo Resource Server).
+- `PingController` — `GET /public/ping` (sempre 200); `GET /consumer/ping` (ecoa o header `X-Amzn-Mtls-Clientcert-Subject` que o ALB injeta quando o mutual TLS é validado, e o `sub` do JWT já validado pelo Resource Server); `GET /consumer/terminal-pode/ping` e `GET /consumer/terminal-nao-pode/ping` (mesma coisa, mas exigem role — a checagem de role já aconteceu no `SecurityConfig` antes de chegar aqui, o controller só devolve `200`).
 - `KeycloakService` — `fetchServiceAccountToken` (client_credentials, só pra Admin API), `findUserIdByUsername`/`createUser` (Admin REST API, com `firstName`/`lastName`/`email` mock e senha derivada), `derivePassword` (`seed + serialNumber`), `loginAsTerminal` (`grant_type=password` contra o client `step-ca-oidc`, `scope=openid`, lê `id_token` da resposta).
-- `SecurityConfig` — OAuth2 Resource Server: exige Bearer token válido em `/consumer/**` (`/public/ping` e `/auth/token` continuam livres); `JwtDecoder` customizado adiciona validação de `aud=step-ca-oidc` em cima da validação padrão (assinatura via JWKS, `iss`, `exp`).
+- `SecurityConfig` — OAuth2 Resource Server: exige Bearer token válido em `/consumer/**` (`/public/ping` e `/auth/token` continuam livres), e role específico em `/consumer/terminal-pode/**`/`/consumer/terminal-nao-pode/**` (`hasRole(...)`, checado antes da regra genérica); `JwtDecoder` customizado adiciona validação de `aud=step-ca-oidc` em cima da validação padrão (assinatura via JWKS, `iss`, `exp`); `jwtAuthenticationConverter` extrai `realm_access.roles` do token (claim específico do Keycloak, não é o `scope`/`scp` que o Spring olha por padrão) e vira `GrantedAuthority` com prefixo `ROLE_`.
 - `terraform/ecs.tf` — task definition (env `KEYCLOAK_BASE_URL`, secrets `KEYCLOAK_BACKEND_CLIENT_SECRET`/`KEYCLOAK_STEPCA_CLIENT_SECRET`/`TERMINAL_AUTH_SEED` do SSM — o último gerado pelo próprio Terraform via `random_password`), 2 target groups (`backend-public-tg`, `backend-consumer-tg`), service com os 2 `load_balancer` blocks.
 - `terraform/alb-rules.tf` — regra no listener 80 para `/auth/token` + `/public/ping` → target group público; regra de bloqueio (404) para `/consumer/*` no listener 80; regra no listener 8443 (mTLS) para `/consumer/*` → target group consumer.
 
@@ -115,6 +121,21 @@ curl --cert chain.pem --key client.key \
 # number a partir do cert_subject, e necessario consultar o Keycloak
 # (GET /admin/realms/poc-terminal/users/{sub}) - o certificado sozinho nao
 # carrega essa informacao.
+
+# Terceira camada (autorizacao por role) - precisa de um terminal criado
+# DEPOIS da config de roles no poc-keycloak (secao 8.9) - serial numbers
+# antigos nao tem "terminal_pode" retroativamente:
+curl --cert chain.pem --key client.key \
+  -H "Authorization: Bearer ${TOKEN}" \
+  https://<shared-alb-dns>:8443/consumer/terminal-pode/ping
+# esperado: 200 (todo terminal novo ja nasce com o role terminal_pode, via
+# default-roles-poc-terminal)
+
+curl -i --cert chain.pem --key client.key \
+  -H "Authorization: Bearer ${TOKEN}" \
+  https://<shared-alb-dns>:8443/consumer/terminal-nao-pode/ping
+# esperado: 403 (nenhum terminal tem o role terminal_nao_pode, de proposito -
+# prova que a autorizacao por role bloqueia quem nao deveria passar)
 ```
 
 ## 8. Fora de escopo
