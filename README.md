@@ -17,6 +17,8 @@ Simplificado em relação ao plano corporativo real: sem domínio próprio, sem 
 - `GET /public/ping` — porta 80 (HTTP), sempre 200, sem exigir nada (prova que a porta "normal" funciona).
 - `GET /consumer/ping` — só acessível pelo listener **mTLS** (8443); no listener 80 esse path é explicitamente bloqueado (404 fixo) pelo Terraform deste repositório.
 
+**mTLS é uma propriedade da porta, não do path**: o ALB tem dois listeners diferentes pro mesmo backend — porta 80 (HTTP puro, sem certificado nenhum) e porta 8443 (HTTPS com `MutualAuthentication.Mode=verify`, exige certificado do cliente **antes até do handshake TLS terminar**). Cada listener só encaminha um subconjunto de paths (ver seção 3). Por isso `/public/ping` só funciona em `http://.../public/ping` (não está roteado na 8443) e `/consumer/ping` só funciona em `https://...:8443/consumer/ping` (bloqueado de propósito na 80). Tentar a combinação errada (ex.: `https://` na porta 80, ou `/public/ping` na 8443) não faz sentido nesse desenho — não é possível "ligar/desligar" mTLS por path numa mesma porta.
+
 Fala com o Keycloak sempre via Cloud Map (`http://keycloak.poc-mtls.local:8080`), nunca por IP.
 
 **Por que não é Token Exchange (e por que isso importa)**: a primeira versão deste serviço tentava emitir o token via **OAuth2 Token Exchange** (RFC 8693), impersonando o terminal com a identidade do próprio `poc-backend`. Validamos, testando ao vivo contra o Keycloak, que esse grant **nunca devolve `id_token`** — não importa `scope=openid`, `audience` ou `requested_token_type`, é uma limitação do mecanismo (Token Exchange v1 do Keycloak foi feito pra impersonação access-token-a-access-token, não pra emitir credenciais OIDC completas). O step-ca exige um **ID Token de verdade** (`aud` batendo no client `step-ca-oidc`) — sem isso ele recusa com `401`. A solução real: usar **Direct Access Grant** (`grant_type=password`), que é o único grant que autentica de fato um "usuário" e por isso emite `id_token`. Isso significa que o usuário-terminal **passa a ter senha** — ver `KeycloakService`.
@@ -85,8 +87,22 @@ curl http://<shared-alb-dns>/public/ping
 curl -i http://<shared-alb-dns>/consumer/ping
 # esperado: 404 (bloqueado no listener HTTP)
 
-curl --cert client.crt --key client.key https://<shared-alb-dns>:8443/consumer/ping
+# IMPORTANTE: precisa da cadeia completa (certificado + CA intermediaria),
+# nao so o "crt" sozinho - senao o ALB derruba a conexao (ECONNRESET) na
+# validacao do mTLS, mesmo com um certificado valido e dentro da validade
+# (erro real encontrado ao testar isso). Concatene "crt" + "ca" da resposta
+# do /1.0/sign (ver README do poc-certificate) num unico arquivo:
+cat crt.pem ca.pem > chain.pem
+
+curl --cert chain.pem --key client.key https://<shared-alb-dns>:8443/consumer/ping
 # esperado (depois de ter um certificado valido emitido pelo step-ca): 200
+# {"status":"ok","cert_subject":"CN=<uuid-do-usuario-no-keycloak>"}
+# repare que o cert_subject NAO e o serialNumber - o step-ca usa o "sub" do
+# id_token (o id interno do usuario no Keycloak) como identidade do
+# certificado, ignorando o CN pedido no CSR. Se precisar recuperar o serial
+# number a partir do cert_subject, e necessario consultar o Keycloak
+# (GET /admin/realms/poc-terminal/users/{sub}) - o certificado sozinho nao
+# carrega essa informacao.
 ```
 
 ## 8. Fora de escopo
